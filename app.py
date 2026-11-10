@@ -1,55 +1,134 @@
-import streamlit as st
-from PIL import Image
-from io import BytesIO
-import config
-from ai_img2img import generate_remake_images
-from ai_tutorial import generate_tutorial
-from community import init_db, publish_work, list_works, like_work, publish_exchange, list_exchanges
-from cases import CASES, recommend_cases
+import io
+import random
 
-init_db()
+import streamlit as st
+
+import config
+from ai_img2img import (
+    generate_remake_images,
+    image_to_jpeg_bytes,
+    image_to_png_bytes,
+    images_to_zip,
+    prepare_base_image,
+)
+from ai_tutorial import generate_tutorial
+from cases import CASES, recommend_cases
+from community import init_db, like_work, list_exchanges, list_works, publish_exchange, publish_work
 
 st.set_page_config(page_title="旧物创意改造平台", page_icon="♻️", layout="wide")
+init_db()
 
-page = st.sidebar.selectbox("📍 功能导航", ["🛠️ 改造工具", "📚 案例灵感", "🌐 社区广场"])
+NAV_OPTIONS = ["🛠️ 改造工具", "📚 案例灵感", "🌐 社区广场"]
+STYLE_OPTIONS = ["", "简约北欧风", "日式原木风", "工业风", "复古风", "可爱卡通风"]
+
+# 从「案例灵感」跳转过来时，先把目标页写进 session_state，再渲染导航
+_nav_to = st.session_state.pop("nav_to", None)
+if _nav_to in NAV_OPTIONS:
+    st.session_state["nav"] = _nav_to
+st.session_state.setdefault("nav", NAV_OPTIONS[0])
+
+page = st.sidebar.selectbox("📍 功能导航", NAV_OPTIONS, key="nav")
 
 with st.sidebar:
     st.divider()
     st.header("⚙️ API 配置")
-    st.caption("直接粘贴key即可，无需设环境变量")
-    img_key = st.text_input("图生图 Key（DashScope）", type="password", placeholder="粘贴阿里云DashScope key")
-    llm_key = st.text_input("LLM Key（DeepSeek）", type="password", placeholder="粘贴DeepSeek key")
+    st.caption("直接粘贴 key 即可，无需设环境变量；也可用环境变量 DASHSCOPE_API_KEY / DEEPSEEK_API_KEY")
+    img_key = st.text_input(
+        "图生图 Key（DashScope）", type="password", placeholder="粘贴阿里云百炼 DashScope key"
+    )
+    llm_key = st.text_input(
+        "LLM Key（DeepSeek）", type="password", placeholder="粘贴 DeepSeek key"
+    )
     if img_key:
-        config.DASHSCOPE_API_KEY = img_key
+        config.DASHSCOPE_API_KEY = img_key.strip()
     if llm_key:
-        config.DEEPSEEK_API_KEY = llm_key
-    img_ok = bool(config.DASHSCOPE_API_KEY)
-    llm_ok = bool(config.DEEPSEEK_API_KEY)
-    st.write(f"图生图API: {'✅ 已配置' if img_ok else '❌ 演示模式'}")
-    st.write(f"LLM API: {'✅ 已配置' if llm_ok else '❌ 演示模式'}")
+        config.DEEPSEEK_API_KEY = llm_key.strip()
+    st.write(f"图生图 API: {'✅ 已配置' if config.DASHSCOPE_API_KEY else '❌ 演示模式'}")
+    st.write(f"LLM API: {'✅ 已配置' if config.DEEPSEEK_API_KEY else '❌ 演示模式'}")
+    with st.expander("💡 图生图说明"):
+        st.caption(
+            "图生图使用万相通用图像编辑（wanx2.1-imageedit）：会保留原物的轮廓、材质和主色，"
+            "再按你的需求改造成新物品。每张约 $0.02，按生成张数计费。"
+        )
 
 st.title("♻️ 生成式AI旧物创意改造与循环共享平台")
 
+
+def _run_generation(request: dict, regenerate: bool = False) -> bool:
+    """调用图生图并把结果写进 session_state，避免页面一交互就丢失。"""
+    progress_bar = st.progress(0.0, text="正在准备…")
+
+    def on_progress(ratio: float, text: str) -> None:
+        progress_bar.progress(max(0.0, min(1.0, float(ratio))), text=text)
+
+    try:
+        result = generate_remake_images(
+            request["image_bytes"],
+            request["old_item_desc"],
+            request["requirement"],
+            request.get("chosen_style", ""),
+            count=int(request.get("count", 3)),
+            strength=request.get("strength"),
+            seed=random.randint(1, 2147483646) if regenerate else request.get("seed"),
+            progress=on_progress,
+        )
+    except Exception as exc:  # 图片损坏、尺寸不合法等
+        progress_bar.empty()
+        st.error(f"生成失败：{exc}")
+        return False
+
+    progress_bar.empty()
+    st.session_state["remake"] = result
+    return True
+
+
 # ==================== 页面一：改造工具 ====================
-if page == "🛠️ 改造工具":
+if page == NAV_OPTIONS[0]:
+    prefill = st.session_state.pop("prefill", None)
+    if prefill:
+        st.session_state["f_old"] = prefill.get("old_item", "")
+        st.session_state["f_req"] = prefill.get("requirement", "")
+        style = prefill.get("style", "")
+        if style in STYLE_OPTIONS:
+            st.session_state["f_style"] = style
+        st.info(f"已载入案例：{prefill.get('old_item', '')} → {prefill.get('requirement', '')}，上传照片即可生成")
+
     st.caption("上传旧物 → AI生成方案 → 输出教程 → 动手改造 → 分享社区")
 
     with st.form("remake_form", clear_on_submit=False):
         col1, col2 = st.columns(2)
         with col1:
             st.subheader("1️⃣ 上传旧物照片")
-            uploaded = st.file_uploader("选择旧物照片", type=["jpg", "jpeg", "png"])
+            uploaded = st.file_uploader(
+                "选择旧物照片（建议正面拍摄、光线充足、主体占画面 2/3）",
+                type=["jpg", "jpeg", "png", "webp"],
+            )
             if uploaded:
                 st.image(uploaded, caption="旧物原图", use_container_width=True)
 
         with col2:
             st.subheader("2️⃣ 描述旧物与改造需求")
-            old_item_desc = st.text_input("旧物描述", placeholder="如：旧牛仔外套")
-            requirement = st.text_area(
-                "改造需求", placeholder="如：改成猫咪窝，带软垫设计，适合8斤内猫咪"
+            old_item_desc = st.text_input(
+                "旧物描述", key="f_old", placeholder="如：旧牛仔外套"
             )
-            style_options = ["", "简约北欧风", "日式原木风", "工业风", "复古风", "可爱卡通风"]
-            chosen_style = st.selectbox("风格偏好（可选）", style_options)
+            requirement = st.text_area(
+                "改造需求", key="f_req", placeholder="如：改成猫咪窝，带软垫设计，适合8斤内猫咪"
+            )
+            chosen_style = st.selectbox("风格偏好（可选）", STYLE_OPTIONS, key="f_style")
+            opt1, opt2 = st.columns(2)
+            with opt1:
+                count = st.slider("生成数量", 1, 4, 3, key="f_count")
+            with opt2:
+                strength = st.slider(
+                    "改造强度",
+                    0.3,
+                    0.9,
+                    0.65,
+                    0.05,
+                    key="f_strength",
+                    help="越大越偏离原物、创意越强；越小越保留原物特征",
+                )
+            st.caption("提示：改造强度 0.5~0.7 通常最稳；需要大改结构时可调到 0.8 以上")
 
         submitted = st.form_submit_button("🚀 生成改造方案", type="primary")
 
@@ -59,44 +138,131 @@ if page == "🛠️ 改造工具":
         elif not old_item_desc.strip() or not requirement.strip():
             st.warning("⚠️ 请填写旧物描述和改造需求")
         else:
-            with st.spinner("AI正在生成改造效果（约10-30秒）..."):
-                images, img_status = generate_remake_images(old_item_desc, requirement, count=3)
+            image_bytes = uploaded.getvalue()
+            if len(image_bytes) > config.IMG_MAX_UPLOAD_MB * 1024 * 1024:
+                st.error(f"图片超过 {config.IMG_MAX_UPLOAD_MB}MB，请压缩后再上传")
+            else:
+                request = {
+                    "image_bytes": image_bytes,
+                    "old_item_desc": old_item_desc.strip(),
+                    "requirement": requirement.strip(),
+                    "chosen_style": chosen_style,
+                    "count": count,
+                    "strength": strength,
+                    "seed": None,
+                }
+                st.session_state["last_request"] = request
+                st.session_state["share_title"] = f"{old_item_desc.strip()}改造作品"
+                st.session_state.pop("remake", None)
+                st.session_state.pop("tutorial", None)
 
-            st.info(img_status)
-            if images:
-                st.subheader("3️⃣ AI生成的改造效果")
-                cols = st.columns(3)
-                captions = ["方案A", "方案B", "方案C"]
-                for col, img, cap in zip(cols, images, captions):
-                    with col:
-                        st.image(img, caption=cap, use_container_width=True)
+                if _run_generation(request):
+                    with st.spinner("AI 正在生成实操教程..."):
+                        st.session_state["tutorial"] = generate_tutorial(
+                            old_item_desc.strip(), requirement.strip(), chosen_style
+                        )
 
-            with st.spinner("AI正在生成实操教程..."):
-                tutorial = generate_tutorial(old_item_desc, requirement, chosen_style)
+    result = st.session_state.get("remake")
+    labels = [chr(65 + i) for i in range(len(result.images))] if result else []
 
-            if tutorial:
-                st.subheader("4️⃣ 智能实操教程")
-                st.markdown(tutorial)
+    if result:
+        st.divider()
+        st.subheader("3️⃣ AI 生成的改造效果")
+        if result.mode == "api":
+            st.success(result.status)
+        else:
+            st.info(result.status)
+        if result.error:
+            st.warning(f"接口错误详情：{result.error}")
+        for warning in result.warnings:
+            st.caption(f"💡 {warning}")
+
+        columns = st.columns(len(result.images))
+        for index, (column, image, label) in enumerate(zip(columns, result.images, labels)):
+            with column:
+                st.image(image, caption=f"方案{label}", use_container_width=True)
                 st.download_button(
-                    "📥 下载教程",
-                    tutorial,
-                    file_name=f"{old_item_desc}改造教程.md",
-                    mime="text/markdown",
+                    "⬇️ 下载该方案",
+                    data=image_to_png_bytes(image),
+                    file_name=f"改造方案{label}.png",
+                    mime="image/png",
+                    key=f"dl_{result.token}_{index}",
                 )
 
-                st.divider()
-                st.subheader("5️⃣ 分享到社区")
-                share_title = st.text_input("给作品起个标题", value=f"{old_item_desc}改造作品")
-                if st.button("📢 发布到社区广场"):
-                    img_bytes = None
-                    if uploaded:
-                        uploaded.seek(0)
-                        img_bytes = uploaded.read()
-                    publish_work(share_title, requirement, old_item_desc, requirement, img_bytes)
-                    st.success("✅ 已发布到社区广场，大家都能看到你的作品啦！")
+        action1, action2, _ = st.columns([1, 1, 2])
+        with action1:
+            if st.button("🔄 换一批方案", key=f"regen_{result.token}"):
+                request = st.session_state.get("last_request")
+                if request and _run_generation(request, regenerate=True):
+                    st.rerun()
+        with action2:
+            st.download_button(
+                "📦 打包下载全部",
+                data=images_to_zip(result.images),
+                file_name="改造方案.zip",
+                mime="application/zip",
+                key=f"zip_{result.token}",
+            )
+
+        with st.expander("🔍 本次提示词与调试信息"):
+            st.code(result.prompt, language="text")
+            st.caption(
+                f"模式：{result.mode} · 耗时：{result.elapsed:.1f}s"
+                + (f" · task_id：{result.task_id}" if result.task_id else "")
+            )
+            if result.mode == "demo":
+                if result.error:
+                    st.caption("演示预览由本地调色生成；本次接口调用失败，可能已产生费用。")
+                else:
+                    st.caption(
+                        "演示预览由本地调色生成，未调用图生图 API、不消耗额度；"
+                        "配置 DashScope Key 后会调用 wanx2.1-imageedit 生成真实效果图。"
+                    )
+
+    tutorial = st.session_state.get("tutorial")
+    if tutorial:
+        st.divider()
+        st.subheader("4️⃣ 智能实操教程")
+        st.markdown(tutorial)
+        request = st.session_state.get("last_request") or {}
+        st.download_button(
+            "📥 下载教程",
+            tutorial,
+            file_name=f"{request.get('old_item_desc', '旧物')}改造教程.md",
+            mime="text/markdown",
+            key="dl_tutorial",
+        )
+
+        st.divider()
+        st.subheader("5️⃣ 分享到社区")
+        st.text_input("给作品起个标题", key="share_title")
+
+        share_options = [f"方案{label}" for label in labels]
+        if request.get("image_bytes"):
+            share_options.append("原图")
+        picked = st.radio(
+            "选择要发布的图片",
+            share_options,
+            horizontal=True,
+            key=f"share_pick_{result.token if result else 'none'}",
+        )
+        if st.button("📢 发布到社区广场", type="primary"):
+            if picked == "原图" or not result:
+                cover = prepare_base_image(request["image_bytes"])
+            else:
+                cover = result.images[labels.index(picked.replace("方案", ""))]
+            publish_work(
+                (st.session_state.get("share_title") or "").strip()
+                or f"{request.get('old_item_desc', '旧物')}改造作品",
+                request.get("requirement", ""),
+                request.get("old_item_desc", ""),
+                request.get("requirement", ""),
+                image_to_jpeg_bytes(cover, max_side=1200),
+            )
+            st.success("✅ 已发布到社区广场，大家都能看到你的作品啦！")
 
 # ==================== 页面二：案例灵感 ====================
-elif page == "📚 案例灵感":
+elif page == NAV_OPTIONS[1]:
     st.caption("精选旧物改造案例，获取灵感与参考")
 
     tag_options = ["衣物", "玻璃", "塑料", "家具", "橡胶", "植物", "宠物", "收纳", "环保", "创意", "户外", "复古风", "北欧风", "简约", "田园风"]
@@ -109,9 +275,9 @@ elif page == "📚 案例灵感":
         shown = CASES
 
     for i in range(0, len(shown), 2):
-        cols = st.columns(2)
-        for col, case in zip(cols, shown[i : i + 2]):
-            with col:
+        columns = st.columns(2)
+        for column, case in zip(columns, shown[i : i + 2]):
+            with column:
                 with st.container(border=True):
                     st.subheader(case["title"])
                     diff_color = {"简单": "green", "中等": "orange", "困难": "red"}.get(case["difficulty"], "gray")
@@ -124,12 +290,16 @@ elif page == "📚 案例灵感":
                     with st.expander("查看材料与步骤"):
                         st.write(f"**材料**：{case['materials']}")
                         st.write(f"**步骤**：{case['steps']}")
-                    if st.button(f"用这个案例去改造", key=f"case_{i}_{case['title']}"):
-                        st.session_state["case_pick"] = case
-                        st.switch_page("app.py")
+                    if st.button("用这个案例去改造", key=f"case_{i}_{case['title']}"):
+                        st.session_state["prefill"] = {
+                            "old_item": case["old_item"],
+                            "requirement": case["result"],
+                        }
+                        st.session_state["nav_to"] = NAV_OPTIONS[0]
+                        st.rerun()
 
 # ==================== 页面三：社区广场 ====================
-elif page == "🌐 社区广场":
+elif page == NAV_OPTIONS[2]:
     tab1, tab2 = st.tabs(["🎨 改造成果", "🔄 闲置置换"])
 
     with tab1:
@@ -138,22 +308,22 @@ elif page == "🌐 社区广场":
         if not works:
             st.info("社区还没有作品，去「改造工具」生成方案后发布吧！")
         else:
-            for w in works:
+            for work in works:
                 with st.container(border=True):
                     col_a, col_b = st.columns([1, 3])
                     with col_a:
-                        if w["image"]:
-                            st.image(BytesIO(w["image"]), width=150)
+                        if work["image"]:
+                            st.image(io.BytesIO(work["image"]), width=150)
                         else:
                             st.write("🖼️")
                     with col_b:
-                        st.markdown(f"**{w['title']}**")
-                        st.caption(f"by {w['author']} · {w['created_at']}")
-                        st.write(f"旧物：{w['old_item']} → {w['requirement']}")
+                        st.markdown(f"**{work['title']}**")
+                        st.caption(f"by {work['author']} · {work['created_at']}")
+                        st.write(f"旧物：{work['old_item'] or '-'} → {work['requirement'] or '-'}")
                         c1, c2 = st.columns([1, 4])
                         with c1:
-                            if st.button(f"❤️ {w['likes']}", key=f"like_{w['id']}"):
-                                like_work(w["id"])
+                            if st.button(f"❤️ {work['likes']}", key=f"like_{work['id']}"):
+                                like_work(work["id"])
                                 st.rerun()
 
         st.divider()
@@ -178,11 +348,11 @@ elif page == "🌐 社区广场":
         if not exchanges:
             st.info("暂无置换信息，来发布第一条吧！")
         else:
-            for e in exchanges:
+            for exchange in exchanges:
                 with st.container(border=True):
-                    st.markdown(f"**{e['item_name']}**  ·  `{e['category'] or '未分类'}`")
-                    st.write(e["description"] or "")
-                    st.caption(f"联系方式：{e['contact']} · {e['created_at']}")
+                    st.markdown(f"**{exchange['item_name']}**  ·  `{exchange['category'] or '未分类'}`")
+                    st.write(exchange["description"] or "")
+                    st.caption(f"联系方式：{exchange['contact']} · {exchange['created_at']}")
 
         st.divider()
         st.subheader("📥 发布置换信息")
